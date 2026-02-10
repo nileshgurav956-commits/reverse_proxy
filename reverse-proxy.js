@@ -1,10 +1,11 @@
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const crypto = require('crypto');
 
 // Configuration
 const PORT = process.env.PORT || 3000;
-const ENCRYPTION_KEY = 'fVwH6G9bLm2NPtXvR8sC3jK5dE9nZqYr'; // Must match local proxy
+const ENCRYPTION_KEY = 'fVwH6G9bLm2NPtXvR8sC3jK5dE9nZqYr';
 const IV_LENGTH = 16;
 
 // Decryption function
@@ -41,12 +42,80 @@ function parseUrl(url) {
 
 // Reverse proxy server
 const server = http.createServer((req, res) => {
-  if (req.method !== 'POST') {
+  // Health check
+  if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200);
-    res.end('Encrypted Reverse Proxy Running');
+    res.end('Encrypted Reverse Proxy Running (HTTP + HTTPS CONNECT Support)');
     return;
   }
 
+  // Handle HTTPS CONNECT tunneling
+  if (req.method === 'POST' && req.url === '/connect') {
+    handleConnectTunnel(req, res);
+    return;
+  }
+
+  // Handle regular HTTP proxying
+  if (req.method === 'POST' && req.url === '/http') {
+    handleHttpProxy(req, res);
+    return;
+  }
+
+  res.writeHead(404);
+  res.end('Not Found');
+});
+
+// Handle HTTPS CONNECT tunnel requests
+function handleConnectTunnel(req, res) {
+  let body = [];
+  req.on('data', chunk => body.push(chunk));
+
+  req.on('end', async () => {
+    try {
+      body = Buffer.concat(body).toString();
+      
+      // Decrypt the CONNECT request
+      const decryptedData = decrypt(body);
+      const targetHost = decryptedData.host;
+      
+      console.log(`[REVERSE] Creating HTTPS tunnel to ${targetHost}`);
+      
+      // Parse host and port
+      const [hostname, port = 443] = targetHost.split(':');
+      
+      // Create connection to target server
+      const targetSocket = net.connect(port, hostname, () => {
+        console.log(`[REVERSE] ✓ Connected to ${targetHost}`);
+        
+        // Send success response
+        res.writeHead(200, {
+          'Content-Type': 'text/plain',
+          'Connection': 'keep-alive'
+        });
+        
+        // Upgrade the connection to raw TCP
+        res.socket.pipe(targetSocket);
+        targetSocket.pipe(res.socket);
+      });
+
+      targetSocket.on('error', (err) => {
+        console.error(`[REVERSE] ✗ Target connection error for ${targetHost}:`, err.message);
+        if (!res.headersSent) {
+          res.writeHead(502);
+          res.end('Bad Gateway');
+        }
+      });
+
+    } catch (error) {
+      console.error('[REVERSE] CONNECT Error:', error.message);
+      res.writeHead(500);
+      res.end('Tunnel Error: ' + error.message);
+    }
+  });
+}
+
+// Handle regular HTTP proxy requests
+function handleHttpProxy(req, res) {
   let body = [];
   req.on('data', chunk => body.push(chunk));
 
@@ -56,7 +125,7 @@ const server = http.createServer((req, res) => {
 
       // Decrypt the request
       const decryptedRequest = decrypt(body);
-      console.log(`[REVERSE] Forwarding: ${decryptedRequest.method} ${decryptedRequest.url}`);
+      console.log(`[REVERSE] HTTP Forwarding: ${decryptedRequest.method} ${decryptedRequest.url}`);
 
       // Parse the URL
       const { protocol, host, path } = parseUrl(decryptedRequest.url);
@@ -120,13 +189,14 @@ const server = http.createServer((req, res) => {
       proxyReq.end();
 
     } catch (error) {
-      console.error('[REVERSE] Error:', error.message);
+      console.error('[REVERSE] HTTP Error:', error.message);
       res.writeHead(500);
       res.end('Decryption Error: ' + error.message);
     }
   });
-});
+}
 
 server.listen(PORT, () => {
   console.log(`[REVERSE] Encrypted reverse proxy running on port ${PORT}`);
+  console.log(`[REVERSE] Supports HTTP and HTTPS CONNECT tunneling`);
 });
