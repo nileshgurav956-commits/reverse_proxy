@@ -1,0 +1,19 @@
+{
+  "name": "encrypted-reverse-proxy",
+  "version": "1.0.0",
+  "description": "Encrypted reverse proxy for privacy",
+  "main": "reverse-proxy.js",
+  "scripts": {
+    "start": "node reverse-proxy.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "proxy",
+    "encryption",
+    "privacy"
+  ],
+  "author": "",
+  "license": "MIT"
+}
