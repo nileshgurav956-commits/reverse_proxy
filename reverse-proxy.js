@@ -10,13 +10,18 @@ const IV_LENGTH = 16;
 
 // Decryption function
 function decrypt(text) {
-  const parts = text.split(':');
-  const iv = Buffer.from(parts.shift(), 'hex');
-  const encryptedText = Buffer.from(parts.join(':'), 'hex');
-  const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
-  let decrypted = decipher.update(encryptedText);
-  decrypted = Buffer.concat([decrypted, decipher.final()]);
-  return JSON.parse(decrypted.toString());
+  try {
+    const parts = text.split(':');
+    const iv = Buffer.from(parts.shift(), 'hex');
+    const encryptedText = Buffer.from(parts.join(':'), 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
+    let decrypted = decipher.update(encryptedText);
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
+    return JSON.parse(decrypted.toString());
+  } catch (e) {
+    console.error('[REVERSE] Decryption error:', e.message);
+    return null;
+  }
 }
 
 // Encryption function
@@ -28,7 +33,7 @@ function encrypt(text) {
   return iv.toString('hex') + ':' + encrypted.toString('hex');
 }
 
-// Parse URL to get protocol, host, path
+// Parse URL
 function parseUrl(url) {
   const match = url.match(/^(https?:\/\/)?([^\/]+)(\/.*)?$/);
   if (!match) throw new Error('Invalid URL');
@@ -40,18 +45,18 @@ function parseUrl(url) {
   return { protocol, host, path };
 }
 
-// Reverse proxy server
+// Server
 const server = http.createServer((req, res) => {
   // Health check
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200);
-    res.end('Encrypted Reverse Proxy Running (v2 - HTTP + HTTPS)');
+    res.end('Encrypted Reverse Proxy (HTTP + HTTPS CONNECT)');
     return;
   }
 
-  // Handle proxy requests
-  if (req.method === 'POST') {
-    handleProxyRequest(req, res);
+  // Handle HTTP proxy
+  if (req.method === 'POST' && req.url === '/proxy') {
+    handleHttpProxy(req, res);
     return;
   }
 
@@ -59,58 +64,61 @@ const server = http.createServer((req, res) => {
   res.end('Not Found');
 });
 
-// Handle CONNECT method for HTTPS tunneling
+// Handle CONNECT method
 server.on('connect', (req, clientSocket, head) => {
   const targetUrl = req.url;
-  
-  console.log(`[REVERSE] CONNECT tunnel request for ${targetUrl}`);
-  
-  try {
-    // Decrypt authorization header if present
-    const auth = req.headers['proxy-authorization'];
-    if (auth) {
-      const decrypted = decrypt(auth);
-      console.log(`[REVERSE] Decrypted target: ${decrypted.target}`);
+  console.log(`[REVERSE] CONNECT request for ${targetUrl}`);
+
+  // Try to decrypt target from header
+  const encryptedTarget = req.headers['x-target'];
+  let targetHost = targetUrl;
+  let targetPort = 443;
+
+  if (encryptedTarget) {
+    const decrypted = decrypt(encryptedTarget);
+    if (decrypted) {
+      targetHost = decrypted.host;
+      targetPort = parseInt(decrypted.port) || 443;
+      console.log(`[REVERSE] Decrypted target: ${targetHost}:${targetPort}`);
     }
-    
-    // Parse target host and port
-    const [hostname, port = 443] = targetUrl.split(':');
-    
-    // Connect to target server
-    const targetSocket = net.connect(port, hostname, () => {
-      console.log(`[REVERSE] ✓ Connected to ${targetUrl}`);
-      
-      // Tell client we're ready
-      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-      
-      // Pipe data bidirectionally
-      targetSocket.pipe(clientSocket);
-      clientSocket.pipe(targetSocket);
-      
-      // Write any buffered data
-      if (head.length) {
-        targetSocket.write(head);
-      }
-    });
-
-    targetSocket.on('error', (err) => {
-      console.error(`[REVERSE] ✗ Target error for ${targetUrl}:`, err.message);
-      clientSocket.end();
-    });
-
-    clientSocket.on('error', (err) => {
-      console.error(`[REVERSE] ✗ Client error:`, err.message);
-      targetSocket.destroy();
-    });
-
-  } catch (error) {
-    console.error('[REVERSE] CONNECT Error:', error.message);
-    clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+  } else {
+    // Parse from URL
+    [targetHost, targetPort = 443] = targetUrl.split(':');
   }
+
+  console.log(`[REVERSE] Connecting to ${targetHost}:${targetPort}`);
+
+  // Connect to target
+  const targetSocket = net.connect(targetPort, targetHost, () => {
+    console.log(`[REVERSE] ✓ Connected to ${targetHost}:${targetPort}`);
+    
+    // Send success to client
+    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+
+    // Write any buffered data
+    if (head && head.length > 0) {
+      targetSocket.write(head);
+    }
+
+    // Pipe bidirectionally
+    targetSocket.pipe(clientSocket);
+    clientSocket.pipe(targetSocket);
+  });
+
+  targetSocket.on('error', (err) => {
+    console.error(`[REVERSE] ✗ Target error for ${targetHost}:`, err.message);
+    clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    clientSocket.end();
+  });
+
+  clientSocket.on('error', (err) => {
+    console.error(`[REVERSE] ✗ Client error:`, err.message);
+    targetSocket.destroy();
+  });
 });
 
-// Handle regular proxy requests
-function handleProxyRequest(req, res) {
+// Handle HTTP proxy requests
+function handleHttpProxy(req, res) {
   let body = [];
   req.on('data', chunk => body.push(chunk));
 
@@ -118,15 +126,18 @@ function handleProxyRequest(req, res) {
     try {
       body = Buffer.concat(body).toString();
 
-      // Decrypt the request
       const decryptedRequest = decrypt(body);
+      if (!decryptedRequest) {
+        res.writeHead(400);
+        res.end('Bad Request');
+        return;
+      }
+
       console.log(`[REVERSE] ${decryptedRequest.method} ${decryptedRequest.url}`);
 
-      // Parse the URL
       const { protocol, host, path } = parseUrl(decryptedRequest.url);
       const isHttps = protocol.startsWith('https');
 
-      // Prepare options for the actual request
       const options = {
         hostname: host.split(':')[0],
         port: host.split(':')[1] || (isHttps ? 443 : 80),
@@ -138,11 +149,9 @@ function handleProxyRequest(req, res) {
         }
       };
 
-      // Remove proxy-specific headers
       delete options.headers['proxy-connection'];
       delete options.headers['proxy-authorization'];
 
-      // Make the actual request
       const client = isHttps ? https : http;
       const proxyReq = client.request(options, (proxyRes) => {
         let responseBody = [];
@@ -150,17 +159,16 @@ function handleProxyRequest(req, res) {
         proxyRes.on('data', chunk => responseBody.push(chunk));
         
         proxyRes.on('end', () => {
-          // Package the response
           const responseData = {
             statusCode: proxyRes.statusCode,
             headers: proxyRes.headers,
             body: Buffer.concat(responseBody).toString('base64')
           };
 
-          // Encrypt and send back
           const encryptedResponse = encrypt(responseData);
           res.writeHead(200, { 'Content-Type': 'text/plain' });
           res.end(encryptedResponse);
+          console.log(`[REVERSE] ✓ ${proxyRes.statusCode}`);
         });
       });
 
@@ -169,16 +177,15 @@ function handleProxyRequest(req, res) {
         const errorResponse = {
           statusCode: 502,
           headers: {},
-          body: Buffer.from('Bad Gateway: ' + error.message).toString('base64')
+          body: Buffer.from('Bad Gateway').toString('base64')
         };
         const encryptedResponse = encrypt(errorResponse);
         res.writeHead(200, { 'Content-Type': 'text/plain' });
         res.end(encryptedResponse);
       });
 
-      // Send request body if exists
       if (decryptedRequest.body) {
-        proxyReq.write(Buffer.from(decryptedRequest.body, 'base64'));
+        proxyReq.write(decryptedRequest.body);
       }
       
       proxyReq.end();
@@ -186,12 +193,12 @@ function handleProxyRequest(req, res) {
     } catch (error) {
       console.error('[REVERSE] Error:', error.message);
       res.writeHead(500);
-      res.end('Decryption Error: ' + error.message);
+      res.end('Server Error');
     }
   });
 }
 
 server.listen(PORT, () => {
-  console.log(`[REVERSE] Encrypted reverse proxy running on port ${PORT}`);
-  console.log(`[REVERSE] Supports HTTP POST and CONNECT methods`);
+  console.log(`[REVERSE] Running on port ${PORT}`);
+  console.log(`[REVERSE] HTTP proxy + HTTPS CONNECT support`);
 });
